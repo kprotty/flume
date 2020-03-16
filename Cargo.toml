@@ -14,6 +14,7 @@ readme = "README.md"
 spin = "0.5"
 
 [dev-dependencies]
+floom = { path = "./floom" }
 crossbeam-channel = "0.4"
 criterion = "0.2"
 
