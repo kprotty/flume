@@ -184,24 +184,18 @@ impl<T> Lock<T> {
                     Ordering::Relaxed,
                 ) {
                     Err(e) => state = e,
-                    Ok(_) => {
-                        if init {
-                            let signal = waiter.signal.replace(MaybeUninit::uninit());
-                            drop(unsafe { signal.assume_init() });
-                            return;
-                        }
-                    },
+                    Ok(_) => return,
                 }
                 continue;
             }
 
             let head = (state & Self::QUEUE_MASK) as *const Waiter;
-            if head.is_null() && spin < 6 {
-                if cfg!(unix) {
-                    std::thread::yield_now();
-                } else {
-                    use std::sync::atomic::spin_loop_hint;
+            if spin <= 10 {
+                use std::sync::atomic::spin_loop_hint;
+                if spin < 6 {
                     (0..(1 << spin)).for_each(|_| spin_loop_hint());
+                } else {
+                    std::thread::yield_now();
                 }
                 spin += 1;
                 state = self.state.load(Ordering::Relaxed);
@@ -454,7 +448,7 @@ impl<T> Shared<T> {
                 Err(TryRecvError::Empty) => {},
                 Err(TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
             }
-            if !self.recv_signal.wait(deadline) {
+            if self.recv_signal.wait(deadline) {
                 return Err(RecvTimeoutError::Timeout);
             }
         }
