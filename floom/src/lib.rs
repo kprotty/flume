@@ -1,15 +1,15 @@
 use std::{
-    ptr::null,
+    ptr::read,
     cell::Cell,
-    ops::{Deref, DerefMut},
-    collections::VecDeque,
-    mem::{drop, replace, MaybeUninit},
+    marker::PhantomData,
+    num::NonZeroUsize,
+    mem::{drop, forget},
     time::{Duration, Instant},
     sync::{
         Arc,
         Mutex,
         Condvar,
-        atomic::{fence, AtomicUsize, Ordering},
+        atomic::{spin_loop_hint, AtomicUsize, AtomicBool, Ordering},
     },
 };
 
@@ -64,256 +64,26 @@ impl Signal {
                 Some(deadline) => {
                     let now = Instant::now();
                     let timeout = if now >= deadline {
-                        return false;
+                        *state -= Self::WAITER;
+                        return true;
                     } else {
                         deadline.duration_since(now)
                     };
+
                     let (new_state, timeout) = self.event.wait_timeout(state, timeout).unwrap();
                     state = new_state;
                     if timeout.timed_out() {
-                        *state -= Self::WAITER;
                         let notified = *state & Self::NOTIFY != 0;
                         if notified {
                             *state -= Self::NOTIFY;
+                        } else {
+                            *state -= Self::WAITER;
                         }
-                        return notified;
+                        return !notified;
                     }
                 }
             }
         }
-    }
-}
-
-struct Waiter {
-    signal: Cell<MaybeUninit<Signal>>,
-    prev: Cell<MaybeUninit<*const Self>>,
-    next: Cell<MaybeUninit<*const Self>>,
-    tail: Cell<MaybeUninit<*const Self>>,
-}
-
-impl Waiter {
-    pub fn new() -> Self {
-        Self {
-            signal: Cell::new(MaybeUninit::uninit()),
-            prev: Cell::new(MaybeUninit::uninit()),
-            next: Cell::new(MaybeUninit::uninit()),
-            tail: Cell::new(MaybeUninit::uninit()),
-        }
-    }
-
-    pub fn signal(&self) -> &Signal {
-        unsafe { &*(&*self.signal.as_ptr()).as_ptr() }
-    }
-
-    pub fn next(&self) -> *const Self {
-        unsafe { self.prev.get().assume_init() }
-    }
-
-    pub fn push(&self, head: *const Self, init: &mut bool) -> *const Self {
-        self.next.set(MaybeUninit::new(head));
-        if head.is_null() {
-            self.tail.set(MaybeUninit::new(self));
-        } else {
-            self.tail.set(MaybeUninit::new(null()));
-        }
-
-        if *init {
-            *init = false;
-            self.prev.set(MaybeUninit::new(null()));
-            self.signal.set(MaybeUninit::new(Signal::new()));
-        }
-
-        self
-    }
-
-    pub fn find_tail<'a>(&self) -> &'a Self {
-        unsafe {
-            let mut tail = self.tail.get().assume_init();
-            if tail.is_null() {
-                let mut current = self;
-                while tail.is_null() {
-                    let next = &*current.next.get().assume_init();
-                    next.prev.set(MaybeUninit::new(current));
-                    current = next;
-                    tail = current.tail.get().assume_init();
-                }
-                self.tail.set(MaybeUninit::new(tail));
-            }
-            &*tail
-        }
-    }
-}
-
-struct Lock<T> {
-    state: AtomicUsize,
-    value: Cell<T>,
-}
-
-unsafe impl<T> Send for Lock<T> {}
-unsafe impl<T> Sync for Lock<T> {}
-
-impl<T> Lock<T> {
-    const MUTEX_LOCK: usize = 1 << 0;
-    const QUEUE_LOCK: usize = 1 << 1;
-    const QUEUE_MASK: usize = !(Self::QUEUE_LOCK | Self::MUTEX_LOCK);
-
-    pub fn lock(&self) -> LockGuard<'_, T> {
-        if self
-            .state
-            .compare_exchange_weak(0, Self::MUTEX_LOCK, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            self.lock_slow();
-        }
-        LockGuard { lock: self }
-    }
-
-    #[cold]
-    fn lock_slow(&self) {
-        let mut spin = 0;
-        let mut init = true;
-        let waiter = Waiter::new();
-        let mut state = self.state.load(Ordering::Relaxed);
-
-        loop {
-            if state & Self::MUTEX_LOCK == 0 {
-                match self.state.compare_exchange_weak(
-                    state,
-                    state | Self::MUTEX_LOCK,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                ) {
-                    Err(e) => state = e,
-                    Ok(_) => return,
-                }
-                continue;
-            }
-
-            let head = (state & Self::QUEUE_MASK) as *const Waiter;
-            if spin <= 10 {
-                use std::sync::atomic::spin_loop_hint;
-                if spin < 6 {
-                    (0..(1 << spin)).for_each(|_| spin_loop_hint());
-                } else {
-                    std::thread::yield_now();
-                }
-                spin += 1;
-                state = self.state.load(Ordering::Relaxed);
-                continue;
-            }
-
-            let new_state = waiter.push(head, &mut init) as usize;
-            if let Err(e) = self.state.compare_exchange_weak(
-                state,
-                new_state | (state & !Self::QUEUE_MASK),
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                state = e;
-                continue;
-            }
-
-            waiter.signal().wait(None);
-            waiter.prev.set(MaybeUninit::new(null()));
-            spin = 0;
-            state = self.state.load(Ordering::Relaxed);
-        }
-    }
-
-    pub fn unlock(&self) {
-        if self
-            .state
-            .compare_exchange(Self::MUTEX_LOCK, 0, Ordering::Release, Ordering::Relaxed)
-            .is_err()
-        {
-            self.unlock_slow();
-        }
-    }
-
-    #[cold]
-    fn unlock_slow(&self) {
-        let mut state = self.state.fetch_sub(Self::MUTEX_LOCK, Ordering::Release);
-        loop {
-            if (state & Self::QUEUE_LOCK != 0) || (state & Self::QUEUE_MASK == 0) {
-                return;
-            }
-            match self.state.compare_exchange_weak(
-                state,
-                state | Self::QUEUE_LOCK,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(e) => state = e,
-            }
-        }
-
-        'outer: loop {
-            fence(Ordering::Acquire);
-            let head = unsafe { &*((state & Self::QUEUE_MASK) as *const Waiter) };
-            let tail = head.find_tail();
-
-            if state & Self::MUTEX_LOCK != 0 {
-                match self.state.compare_exchange_weak(
-                    state,
-                    state & !Self::QUEUE_LOCK,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return,
-                    Err(e) => state = e,
-                }
-                continue;
-            }
-
-            let new_tail = tail.next();
-            if new_tail.is_null() {
-                loop {
-                    match self.state.compare_exchange_weak(
-                        state,
-                        state & Self::MUTEX_LOCK,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(e) => state = e,
-                    }
-                    if state & Self::QUEUE_MASK != 0 {
-                        continue 'outer;
-                    }
-                }
-            } else {
-                head.tail.set(MaybeUninit::new(new_tail));
-                self.state.fetch_sub(Self::QUEUE_LOCK, Ordering::Release);
-            }
-
-            tail.signal().notify();
-            return;
-        }
-    }
-}
-
-struct LockGuard<'a, T> {
-    lock: &'a Lock<T>,
-}
-
-impl<'a, T> Drop for LockGuard<'a, T> {
-    fn drop(&mut self) {
-        self.lock.unlock();
-    }
-}
-
-impl<'a, T> Deref for LockGuard<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.lock.value.as_ptr() }
-    }
-}
-
-impl<'a, T> DerefMut for LockGuard<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.lock.value.as_ptr() }
     }
 }
 
@@ -346,61 +116,78 @@ pub enum RecvTimeoutError {
 }
 
 pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
-    bounded(usize::max_value())
+    Shared::new(None)
 }
 
 pub fn bounded<T>(max_items: usize) -> (Sender<T>, Receiver<T>) {
-    let shared = Arc::new(Shared {
-        recv_signal: Signal::new(),
-        send_signal: Signal::new(),
-        senders: AtomicUsize::new(1),
-        inner: Lock {
-            state: AtomicUsize::new(0),
-            value: Cell::new(Inner {
-                max: max_items,
-                queue: VecDeque::new(),
-                disconnected: false,
-                senders_waiting: 0,
-                receiver_waiting: false,
-            }),
-        },
-    });
-
-    (
-        Sender { shared: shared.clone() },
-        Receiver { shared, _not_sync: Cell::new(()) },
-    )
+    Shared::new(NonZeroUsize::new(max_items).map(|max| max.get()))
 }
 
-struct Inner<T> {
-    max: usize,
-    queue: VecDeque<T>,
-    disconnected: bool,
-    senders_waiting: usize,
-    receiver_waiting: bool,
+#[repr(C)]
+struct Node<T> {
+    next: AtomicUsize,
+    item: T,
 }
 
 struct Shared<T> {
-    recv_signal: Signal,
-    send_signal: Signal,
+    stub: AtomicUsize,
+    head: AtomicUsize,
+    tail: Cell<usize>,
     senders: AtomicUsize,
-    inner: Lock<Inner<T>>,
+    item_count: Option<AtomicUsize>,
+    send_signal: Signal,
+    recv_signal: Signal,
+    disconnected: AtomicBool,
+    _phantom: PhantomData<T>,
+}
+
+unsafe impl<T> Send for Shared<T> {}
+unsafe impl<T> Sync for Shared<T> {}
+
+impl<T> Drop for Shared<T> {
+    fn drop(&mut self) {
+        while let Ok(item) = self.try_recv() {
+            drop(item);
+        }
+    }
 }
 
 impl<T> Shared<T> {
-    pub fn disconnect(&self) {
-        let mut inner = self.inner.lock();
-        inner.disconnected = true;
+    pub fn new(max_items: Option<usize>) -> (Sender<T>, Receiver<T>) {
+        let shared = Arc::new(Shared {
+            stub: AtomicUsize::new(0),
+            head: AtomicUsize::new(0),
+            tail: Cell::new(0),
+            senders: AtomicUsize::new(1),
+            item_count: max_items.map(AtomicUsize::new),
+            send_signal: Signal::new(),
+            recv_signal: Signal::new(),
+            disconnected: AtomicBool::new(false),
+            _phantom: PhantomData,
+        });
+        
+        let stub = &shared.stub as *const _ as usize;
+        shared.tail.set(stub);
+        shared.head.store(stub, Ordering::Relaxed);
+
+        (
+            Sender { shared: shared.clone() },
+            Receiver { shared, _not_sync: Cell::new(()) },
+        )
+    }
+
+    pub fn disconnect(&self, is_sender: bool) {
+        self.disconnected.store(true, Ordering::Relaxed);
+        if is_sender {
+            self.recv_signal.notify();
+        }
     }
 
     pub fn send(&self, mut item: T) -> Result<(), SendError<T>> {
-        loop {
-            item = match self.try_send_inner(item, true) {
-                Ok(()) => return Ok(()),
-                Err(TrySendError::Full(item)) => item,
-                Err(TrySendError::Disconnected(item)) => return Err(SendError::Disconnected(item)),
-            };
-            self.send_signal.wait(None);
+        match self.try_send_inner(item, true) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => unreachable!(),
+            Err(TrySendError::Disconnected(item)) => Err(SendError::Disconnected(item)),
         }
     }
 
@@ -408,80 +195,177 @@ impl<T> Shared<T> {
         self.try_send_inner(item, false)
     }
 
-    fn try_send_inner(&self, item: T, wait: bool) -> Result<(), TrySendError<T>> {
-        let notify_receiver = {
-            let mut inner = self.inner.lock();
-
-            if inner.disconnected {
-                return Err(TrySendError::Disconnected(item));
-            } else if inner.queue.len() == inner.max {
-                inner.senders_waiting += if wait { 1 } else { 0 };
-                return Err(TrySendError::Full(item));
-            }
-
-            inner.queue.push_back(item);
-            replace(&mut inner.receiver_waiting, false)
-        };
-        
-        if notify_receiver {
-            self.recv_signal.notify();
+    fn try_send_inner(&self, item: T, block: bool) -> Result<(), TrySendError<T>> {
+        if self.disconnected.load(Ordering::Relaxed) {
+            return Err(TrySendError::Disconnected(item));
         }
+
+        if let Some(item_count) = self.item_count.as_ref() {
+            let mut count = item_count.load(Ordering::Relaxed);
+            loop {
+                let mut spin = 0;
+                while count != 0 {
+                    match item_count.compare_exchange_weak(
+                        count,
+                        count - 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(e) => count = e,
+                    }
+                    if spin < 6 {
+                        spin += 1;
+                        (0..(1 << spin)).for_each(|_| spin_loop_hint());
+                    } else {
+                        if cfg!(unix) {
+                            std::thread::yield_now();
+                        } else {
+                            (0..100).for_each(|_| spin_loop_hint());
+                        }
+                    }
+                    if self.disconnected.load(Ordering::Relaxed) {
+                        return Err(TrySendError::Disconnected(item));
+                    }
+                }
+                if !block {
+                    return Err(TrySendError::Full(item));
+                }
+                self.send_signal.wait(None);
+                if self.disconnected.load(Ordering::Relaxed) {
+                    return Err(TrySendError::Disconnected(item));
+                }
+                count = item_count.load(Ordering::Relaxed);
+            }
+        }
+
+        let node = Box::new(Node {
+            next: AtomicUsize::new(0),
+            item,
+        });
+        self.push(&node.next as *const _ as usize);
+        forget(node);
         Ok(())
     }
 
     pub fn recv(&self) -> Result<T, RecvError> {
-        match self.recv_inner(None) {
+        match self.try_recv_inner(Some(None)) {
             Ok(item) => Ok(item),
-            Err(RecvTimeoutError::Timeout) => unreachable!(),
-            Err(RecvTimeoutError::Disconnected) => Err(RecvError::Disconnected),
+            Err(None) => unreachable!(),
+            Err(Some(RecvTimeoutError::Timeout)) => unreachable!(),
+            Err(Some(RecvTimeoutError::Disconnected)) => Err(RecvError::Disconnected),
         }
     }
 
     pub fn recv_deadline(&self, deadline: Instant) -> Result<T, RecvTimeoutError> {
-        self.recv_inner(Some(deadline))
-    }
-
-    fn recv_inner(&self, deadline: Option<Instant>) -> Result<T, RecvTimeoutError> {
-        loop {
-            match self.try_recv_inner(true) {
-                Ok(item) => return Ok(item),
-                Err(TryRecvError::Empty) => {},
-                Err(TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
-            }
-            if self.recv_signal.wait(deadline) {
-                return Err(RecvTimeoutError::Timeout);
-            }
+        match self.try_recv_inner(Some(Some(deadline))) {
+            Ok(item) => Ok(item),
+            Err(None) => unreachable!(),
+            Err(Some(error)) => Err(error),
         }
     }
 
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        self.try_recv_inner(false)
+        match self.try_recv_inner(None) {
+            Ok(item) => Ok(item),
+            Err(None) => Err(TryRecvError::Empty),
+            Err(Some(RecvTimeoutError::Timeout)) => unreachable!(),
+            Err(Some(RecvTimeoutError::Disconnected)) => Err(TryRecvError::Disconnected),
+        }
     }
 
-    fn try_recv_inner(&self, wait: bool) -> Result<T, TryRecvError> {
-        let (item, notify_sender) = {
-            let mut inner = self.inner.lock();
-
-            if inner.disconnected {
-                return Err(TryRecvError::Disconnected);
-            } else if inner.queue.len() == 0 {
-                inner.receiver_waiting = wait;
-                return Err(TryRecvError::Empty);
+    fn try_recv_inner(&self, deadline: Option<Option<Instant>>) -> Result<T, Option<RecvTimeoutError>> {
+        let mut spin = 0;
+        loop {
+            if self.disconnected.load(Ordering::Relaxed) {
+                return Err(Some(RecvTimeoutError::Disconnected));
             }
 
-            let item = inner.queue.pop_front().unwrap();
-            if inner.senders_waiting == 0 {
-                (item, false)
-            } else {
-                inner.senders_waiting -= 1;
-                (item, true)
+            let mut retry = false;
+            match self.pop() {
+                Ok(item) => {
+                    if let Some(item_count) = self.item_count.as_ref() {
+                        if item_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                            self.send_signal.notify();
+                        }
+                    }
+                    return Ok(item);
+                },
+                Err(TryRecvError::Disconnected) => retry = true,
+                Err(TryRecvError::Empty) => {
+                    if deadline.is_none() {
+                        return Err(None);
+                    }
+                },
             }
-        };
 
-        if notify_sender {
-            self.send_signal.notify();
+            if spin <= 3 {
+                spin += 1;
+                (0..(1 << spin)).for_each(|_| spin_loop_hint());
+            } else if retry || spin <= 10 {
+                spin += 1;
+                if cfg!(unix) {
+                    std::thread::yield_now();
+                } else {
+                    (0..100).for_each(|_| spin_loop_hint());
+                }
+            } else if let Some(deadline) = deadline {
+                let stub = &self.stub as *const _ as usize;
+                if self.head.compare_exchange(stub, stub|1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    if self.recv_signal.wait(deadline) {
+                        return Err(Some(RecvTimeoutError::Timeout));
+                    }
+                }
+            }
         }
-        Ok(item)
+    }
+
+    fn push(&self, node: usize) {
+        let head = self.head.swap(node, Ordering::AcqRel);
+        let prev = unsafe { &*((head & !1usize) as *const Node<T>) };
+        prev.next.store(node, Ordering::Release);
+
+        if (head & 1) != 0 {
+            self.recv_signal.notify();
+        }
+    }
+
+    fn pop(&self) -> Result<T, TryRecvError> {
+        unsafe {
+            let mut tail = self.tail.get() as *const Node<T>;
+            let stub = &self.stub as *const _ as *const Node<T>;
+            let mut next = (&*tail).next.load(Ordering::Acquire) as *const Node<T>;
+
+            if tail == stub {
+                if next.is_null() {
+                    return Err(TryRecvError::Empty);
+                }
+                tail = next;
+                self.tail.set(tail as usize);
+                next = (&*tail).next.load(Ordering::Acquire) as *const Node<T>;
+            }
+
+            if !next.is_null() {
+                self.tail.set(next as usize);
+                return Ok(read(&Box::from_raw(tail as *mut Node<T>).item));
+            }
+
+            let head = self.head.load(Ordering::Acquire);
+            if head != (tail as usize) {
+                return Err(TryRecvError::Disconnected);
+            }
+
+            self.stub.store(0, Ordering::Relaxed);
+            self.push(stub as usize);
+            next = (&*tail).next.load(Ordering::Acquire) as *const Node<T>;
+
+            if !next.is_null() {
+                self.tail.set(next as usize);
+                return Ok(read(&Box::from_raw(tail as *mut Node<T>).item));
+                
+            }
+            return Err(TryRecvError::Empty);
+        }
     }
 }
 
@@ -499,7 +383,7 @@ impl<T> Clone for Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         if self.shared.senders.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.shared.disconnect();
+            self.shared.disconnect(true);
         }
     }
 }
@@ -521,7 +405,7 @@ pub struct Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.shared.disconnect();
+        self.shared.disconnect(false);
     }
 }
 
