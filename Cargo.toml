@@ -1,6 +1,6 @@
 [package]
 name = "flume"
-version = "0.5.0"
+version = "0.6.1"
 authors = ["Joshua Barretto <joshua.s.barretto@gmail.com>"]
 edition = "2018"
 description = "A blazingly fast multi-producer channel"
@@ -9,6 +9,10 @@ keywords = ["mpsc", "fifo", "channel", "thread", "fast"]
 categories = ["concurrency", "data-structures"]
 license = "Apache-2.0/MIT"
 readme = "README.md"
+
+[features]
+select = []
+default = ["select"]
 
 [dependencies]
 spin = "0.5"

@@ -342,9 +342,9 @@ fn robin_b_4t_1000m(b: &mut Criterion) {
 
 criterion_group!(
     compare,
-    create,
-    oneshot,
-    inout,
+    //create,
+    //oneshot,
+    //inout,
     hydra_32t_1m,
     hydra_32t_1000m,
     hydra_1t_1000m,

@@ -13,6 +13,13 @@
 //! assert_eq!(rx.recv().unwrap(), 42);
 //! ```
 
+#[cfg(feature = "select")]
+pub mod select;
+
+// Reexports
+#[cfg(feature = "select")]
+pub use select::Selector;
+
 use std::{
     collections::VecDeque,
     sync::{Arc, atomic::{AtomicUsize, Ordering}},
@@ -75,17 +82,22 @@ impl<T> Queue<T> {
 
 struct Shared<T> {
     queue: spin::Mutex<Queue<T>>,
-    /// Mutex and Condvar used for notifying the receiver about incoming messages. The inner bool is
-    /// used to indicate that all senders have been dropped and that the channel is 'dead'.
-    wait_lock: Mutex<bool>,
+    /// Mutexed used for locking condvars.
+    wait_lock: Mutex<()>,
+    // Used for notifying the receiver about incoming messages.
     send_trigger: Condvar,
-    recv_trigger: Condvar,
+    send_selectors: spin::Mutex<(usize, Vec<(usize, Arc<SelectorSignal>, Token)>)>,
+    recv_selector: spin::Mutex<Option<(Arc<SelectorSignal>, Token)>>,
+    // Used for notifying senders about the queue no longer being full. Therefore, this is only a
+    // `Some` for bounded queues.
+    recv_trigger: Option<Condvar>,
     /// The number of senders associated with this channel. If this drops to 0, the channel is
     /// 'dead' and the listener will begin reporting disconnect errors (once the queue has been
     /// drained).
     senders: AtomicUsize,
+    /// The number of senders waiting for notifications that the queue has space.
     send_waiters: AtomicUsize,
-    /// An atomic used to describe the state of the receiving end of the queue
+    /// An atomic used to describe the state of the receiving end of the queue:
     /// - 0 => Receiver has been dropped, so the channel is 'dead'
     /// - 1 => Receiver still exists, but is not waiting for notifications
     /// - x => Receiver is waiting for incoming message notifications
@@ -93,25 +105,32 @@ struct Shared<T> {
 }
 
 impl<T> Shared<T> {
-    fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
+    fn try_send(&self, msg: T) -> Result<(), (spin::MutexGuard<Queue<T>>, TrySendError<T>)> {
         loop {
             // Attempt to lock the queue. Upon success, attempt to receive. If the queue is empty,
             // we don't block anyway so just break out of the loop.
             if let Some(mut queue) = self.queue.try_lock() {
                 let listen_mode = self.listen_mode.load(Ordering::Relaxed);
-                // If the listener has disconnected, the channel is dead
-                if listen_mode == 0 {
-                    break Err(TrySendError::Disconnected(msg));
+                if listen_mode == 0 { // If the listener has disconnected, the channel is dead
+                    break Err((queue, TrySendError::Disconnected(msg)));
                 } else {
                     // If pushing fails, it's because the queue is full
                     if let Some(msg) = queue.push(msg) {
-                        break Err(TrySendError::Full(msg));
+                        break Err((queue, TrySendError::Full(msg)));
+                    } else if let Some((signal, token)) = &*self.recv_selector.lock() {
+                        // If there is a recv selector attached, notify that only.
+                        let mut guard = signal.wait_lock.lock().unwrap();
+                        drop(queue);
+                        *guard = Some(*token);
+                        signal.trigger.notify_one();
                     } else if listen_mode > 1 {
                         // Notify the receiver of a new message if listeners are waiting
                         let _ = self.wait_lock.lock().unwrap();
                         // Drop the queue early to avoid a deadlock
                         drop(queue);
                         self.send_trigger.notify_one();
+                    } else {
+                        drop(queue);
                     }
                     break Ok(());
                 }
@@ -124,89 +143,76 @@ impl<T> Shared<T> {
 
     fn send(&self, mut msg: T) -> Result<(), SendError<T>> {
         loop {
-            // Attempt to gain exclusive access to the queue
-            let guard = if let Some(mut queue) = self.queue.try_lock() {
-                let listen_mode = self.listen_mode.load(Ordering::Relaxed);
-                // If list_mode is 0, it means that the receiver has been dropped
-                if listen_mode == 0 {
-                    break Err(SendError(msg));
-                } else {
-                    if let Some(m) = queue.push(msg) {
-                        // If pushing fails, the queue is full: if this is the case, we increment
-                        // send_waiters to inform the receiver that we need a notification, and then we
-                        // take a lock guard to wait on later using the condvar.
-                        msg = m;
-                        self.send_waiters.fetch_add(1, Ordering::Acquire);
-                        Some(self.wait_lock.lock().unwrap())
-                    } else if listen_mode > 1 {
-                        // If listen_mode is greater than one it means that the receiver is passively
-                        // waiting on a notification that new items have entered the queue.
-                        let _ = self.wait_lock.lock().unwrap();
-                        // Drop the queue early to avoid deadlocking when notifying the receiver.
-                        drop(queue);
-                        // Tell the receiver to wake up
-                        self.send_trigger.notify_one();
-                        break Ok(());
-                    } else {
-                        break Ok(());
-                    }
-                }
-            } else {
-                None
+            // Attempt to send a message
+            let queue = match self.try_send(msg) {
+                Ok(()) => break Ok(()),
+                Err((_, TrySendError::Disconnected(msg))) => break Err(SendError(msg)),
+                Err((queue, TrySendError::Full(m))) => {
+                    msg = m;
+                    queue
+                },
             };
 
-            // If the receiver has disconnected
-            if guard
-                .as_ref()
-                .map(|guard| **guard)
-                .unwrap_or(false)
-            {
-                // Normally we would decrement send_waiters here, but since the receiver has
-                // disconnected anyway, it doesn't need to know that we're not waiting any more.
-                break Err(SendError(msg));
-            }
-
-            if let Some(g) = guard {
-                let _ = self.recv_trigger.wait(g).unwrap();
+            if let Some(recv_trigger) = self.recv_trigger.as_ref() {
+                // Take a guard of the main lock to use later when waiting
+                let guard = self.wait_lock.lock().unwrap();
+                // Inform the receiver that we need waking
+                self.send_waiters.fetch_add(1, Ordering::Acquire);
+                // We keep the queue alive until here to avoid a deadlock
+                drop(queue);
+                // Wait until we get a signal that suggests the queue might have space
+                let _ = recv_trigger.wait(guard).unwrap();
+                // Inform the receiver that we no longer need waking
                 self.send_waiters.fetch_sub(1, Ordering::Release);
-            } else {
-                thread::yield_now();
             }
         }
     }
 
     /// Inform the receiver that all senders have been dropped
     fn all_senders_disconnected(&self) {
-        let mut disconnected = self.wait_lock.lock().unwrap();
-        *disconnected = true;
+        let _ = self.wait_lock.lock().unwrap();
         self.send_trigger.notify_all(); // TODO: notify_one instead? Which is faster?
     }
 
     fn receiver_disconnected(&self) {
-        let mut disconnected = self.wait_lock.lock().unwrap();
-        *disconnected = true;
-        self.recv_trigger.notify_all();
+        if let Some(recv_trigger) = self.recv_trigger.as_ref() {
+            let _ = self.wait_lock.lock().unwrap();
+            recv_trigger.notify_all();
+        }
     }
 
-    fn try_recv(&self) -> Result<T, TryRecvError> {
+    fn try_recv(&self) -> Result<T, (spin::MutexGuard<Queue<T>>, TryRecvError)> {
         loop {
             // Attempt to lock the queue. Upon success, attempt to receive. If the queue is empty,
             // we don't block anyway so just break out of the loop.
             if let Some(mut queue) = self.queue.try_lock() {
                 break if let Some(msg) = queue.pop() {
                     // If there are senders waiting for a message, wake them up.
-                    if self.send_waiters.load(Ordering::Relaxed) > 0 {
-                        let _ = self.wait_lock.lock().unwrap();
-                        drop(queue);
-                        self.recv_trigger.notify_one();
+                    if let Some(recv_trigger) = self.recv_trigger.as_ref() {
+                        if queue.1.is_some() && self.send_waiters.load(Ordering::Relaxed) > 0 {
+                            let _ = self.wait_lock.lock().unwrap();
+                            drop(queue);
+                            recv_trigger.notify_one();
+                        }
                     }
+                    // Notify send selectors
+                    self
+                        .send_selectors
+                        .lock()
+                        .1
+                        .iter()
+                        .for_each(|(_, signal, token)| {
+                            let mut guard = signal.wait_lock.lock().unwrap();
+                            *guard = Some(*token);
+                            signal.trigger.notify_one();
+                        });
                     Ok(msg)
                 } else if self.senders.load(Ordering::Relaxed) == 0 {
                     // If there's nothing more in the queue, this might be because there are no
                     // more senders.
-                    Err(TryRecvError::Disconnected)
+                    Err((queue, TryRecvError::Disconnected))
                 } else {
-                    Err(TryRecvError::Empty)
+                    Err((queue, TryRecvError::Empty))
                 };
             } else {
                 // If we can't gain access to the queue, yield until the next time slice
@@ -216,57 +222,25 @@ impl<T> Shared<T> {
     }
 
     fn recv(&self) -> Result<T, RecvError> {
-        let mut disconnected = false;
-
-        let result = loop {
-            // Attempt to gain exclusive access to the queue
-            let guard = if let Some(mut queue) = self.queue.try_lock() {
-                match queue.pop() {
-                    // We've got the message we wanted
-                    Some(msg) => {
-                        if queue.1.is_some() && self.send_waiters.load(Ordering::Relaxed) > 0 {
-                            let _ = self.wait_lock.lock().unwrap();
-                            drop(queue);
-                            self.recv_trigger.notify_one();
-                        }
-                        break Ok(msg)
-                    },
-                    // No messages left, and there are no more senders, so our work here is done.
-                    None if disconnected => break Err(RecvError::Disconnected),
-                    // Sleep when empty
-                    None => {
-                        // Indicate to future senders that we'll need to be woken up since we're
-                        // going to wait upon the condvar trigger.
-                        self.listen_mode.store(2, Ordering::Relaxed);
-                        // Take a guard of the mutex, but do so while the queue is still locked.
-                        // This prevents a deadlock situation occurring.
-                        Some(self.wait_lock.lock().unwrap())
-                    },
-                }
-            } else {
-                None
+        loop {
+            // Attempt to receive a message
+            let queue = match self.try_recv() {
+                Ok(msg) => break Ok(msg),
+                Err((_, TryRecvError::Disconnected)) => break Err(RecvError::Disconnected),
+                Err((queue, TryRecvError::Empty)) => queue,
             };
 
-            // Check to see whether senders still exist
-            disconnected |= guard
-                .as_ref()
-                .map(|guard| **guard)
-                .unwrap_or(false);
-
-            // If the channel is still connected and we've got access to the guard, wait.
-            if let (Some(g), false) = (guard, disconnected) {
-                // Sleep using the guard we took while probing the queue if the queue is empty
-                let _ = self.send_trigger.wait(g).unwrap();
-            } else {
-                // If the queue isn't accessible, assume that it's in use and yield so that
-                // whatever is using it can do its work.
-                thread::yield_now();
-            }
-        };
-        // Ensure the listen mode is reset
-        // TODO: Are we performing more atomic stores than we need to here?
-        self.listen_mode.store(1, Ordering::Release);
-        result
+            // Take a guard of the main lock to use later when waiting
+            let guard = self.wait_lock.lock().unwrap();
+            // Inform the receiver that we need waking
+            self.listen_mode.fetch_add(1, Ordering::Acquire);
+            // We keep the queue alive until here to avoid a deadlock
+            drop(queue);
+            // Wait until we get a signal that the queue has new messages
+            let _ = self.send_trigger.wait(guard).unwrap();
+            // Inform the receiver that we no longer need waking
+            self.listen_mode.fetch_sub(1, Ordering::Release);
+        }
     }
 
     // TODO: Change this to `recv_timeout` to potentially avoid an extra call to `Instant::now()`?
@@ -303,13 +277,32 @@ impl<T> Shared<T> {
             // Attempt to receive a message from the queue
             match self.try_recv() {
                 Ok(msg) => break Ok(msg),
-                Err(TryRecvError::Empty) => {},
-                Err(TryRecvError::Disconnected) => break Err(RecvTimeoutError::Disconnected),
+                Err((_, TryRecvError::Empty)) => {},
+                Err((_, TryRecvError::Disconnected)) => break Err(RecvTimeoutError::Disconnected),
             }
         };
         // Ensure the listen mode is reset
         self.listen_mode.store(1, Ordering::Relaxed);
         result
+    }
+
+    fn connect_send_selector(&self, signal: Arc<SelectorSignal>, token: Token) -> usize {
+        let (id, signals) = &mut *self.send_selectors.lock();
+        *id += 1;
+        signals.push((*id, signal, token));
+        *id
+    }
+
+    fn disconnect_send_selector(&self, id: usize) {
+        self.send_selectors.lock().1.retain(|(s_id, _, _)| s_id != &id);
+    }
+
+    fn connect_recv_selector(&self, signal: Arc<SelectorSignal>, token: Token) {
+        *self.recv_selector.lock() = Some((signal, token))
+    }
+
+    fn disconnect_recv_selector(&self) {
+        *self.recv_selector.lock() = None;
     }
 }
 
@@ -329,7 +322,7 @@ impl<T> Sender<T> {
     /// receiver has been dropped, an error is returned. If the channel associated with this
     /// sender is unbounded, this method has the same behaviour as [`Sender::send`].
     pub fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
-        self.shared.try_send(msg)
+        self.shared.try_send(msg).map_err(|(_, err)| err)
     }
 }
 
@@ -382,7 +375,7 @@ impl<T> Receiver<T> {
     /// Attempt to fetch an incoming value on this receiver, returning an error if the channel is
     /// empty or all channel senders have been dropped.
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        self.shared.try_recv()
+        self.shared.try_recv().map_err(|(_, err)| err)
     }
 
     /// A blocking iterator over the values received on the channel that finishes iteration when
@@ -474,9 +467,11 @@ impl<T> Iterator for IntoIter<T> {
 pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
     let shared = Arc::new(Shared {
         queue: spin::Mutex::new(Queue::new()),
-        wait_lock: Mutex::new(false),
+        wait_lock: Mutex::new(()),
         send_trigger: Condvar::new(),
-        recv_trigger: Condvar::new(),
+        send_selectors: spin::Mutex::new((0, Vec::new())),
+        recv_selector: spin::Mutex::new(None),
+        recv_trigger: None,
         senders: AtomicUsize::new(1),
         send_waiters: AtomicUsize::new(0),
         listen_mode: AtomicUsize::new(1),
@@ -512,9 +507,11 @@ pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
 pub fn bounded<T>(n: usize) -> (Sender<T>, Receiver<T>) {
     let shared = Arc::new(Shared {
         queue: spin::Mutex::new(Queue::bounded(n)),
-        wait_lock: Mutex::new(false),
+        wait_lock: Mutex::new(()),
         send_trigger: Condvar::new(),
-        recv_trigger: Condvar::new(),
+        send_selectors: spin::Mutex::new((0, Vec::new())),
+        recv_selector: spin::Mutex::new(None),
+        recv_trigger: Some(Condvar::new()),
         senders: AtomicUsize::new(1),
         send_waiters: AtomicUsize::new(0),
         listen_mode: AtomicUsize::new(1),
@@ -523,4 +520,14 @@ pub fn bounded<T>(n: usize) -> (Sender<T>, Receiver<T>) {
         Sender { shared: shared.clone() },
         Receiver { shared, _phantom_cell: UnsafeCell::new(()) },
     )
+}
+
+// A unique token corresponding to an event in a selector
+type Token = usize;
+
+// Used to signal to selectors that an event is ready
+struct SelectorSignal {
+    wait_lock: Mutex<Option<usize>>,
+    trigger: Condvar,
+    //listeners: AtomicUsize,
 }
