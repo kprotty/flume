@@ -1,8 +1,9 @@
 use std::{
     cell::UnsafeCell,
-    mem::replace,
+    mem::{swap, replace},
     num::NonZeroUsize,
     collections::VecDeque,
+    ops::Deref,
     time::{Duration, Instant},
     sync::{
         Arc,
@@ -122,20 +123,34 @@ pub fn bounded<T>(max_items: usize) -> (Sender<T>, Receiver<T>) {
     Shared::new(NonZeroUsize::new(max_items).map(|max| max.get()))
 }
 
+#[cfg_attr(target_arch = "x86", repr(align(64)))]
+#[cfg_attr(target_arch = "x86_64", repr(align(128)))]
+struct CachePadded<T> {
+    value: T,
+}
+
+impl<T> Deref for CachePadded<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
 struct Inner<T> {
     queue: VecDeque<T>,
     disconnected: bool,
-    senders_waiting: usize,
     reciever_waiting: bool,
-    max_items: usize,
 }
 
 struct Shared<T> {
     send_signal: Signal,
     recv_signal: Signal,
     senders: AtomicUsize,
-    locked: AtomicBool,
+    available: Option<AtomicUsize>,
     inner: UnsafeCell<Inner<T>>,
+    local_queue: UnsafeCell<VecDeque<T>>,
+    locked: CachePadded<AtomicBool>,
 }
 
 unsafe impl<T> Sync for Shared<T> {}
@@ -146,14 +161,16 @@ impl<T> Shared<T> {
             send_signal: Signal::new(),
             recv_signal: Signal::new(),
             senders: AtomicUsize::new(1),
-            locked: AtomicBool::new(false),
+            available: max_items.map(AtomicUsize::new),
             inner: UnsafeCell::new(Inner {
                 queue: VecDeque::new(),
-                senders_waiting: 0,
-                reciever_waiting: false,
                 disconnected: false,
-                max_items: max_items.unwrap_or(usize::max_value()),
+                reciever_waiting: false,
             }),
+            local_queue: UnsafeCell::new(VecDeque::new()),
+            locked: CachePadded {
+                value: AtomicBool::new(false),
+            },
         });
         
         (
@@ -163,6 +180,8 @@ impl<T> Shared<T> {
     }
 
     fn with_lock<R>(&self, f: impl FnOnce(&mut Inner<T>) -> R) -> R {
+        #[allow(unused)]
+        let mut spin: usize = 0;
         loop {
             if !self.locked.load(Ordering::Relaxed) {
                 if self
@@ -175,7 +194,12 @@ impl<T> Shared<T> {
                     return result;
                 }
             }
-            std::thread::yield_now();
+            if cfg!(unix) {
+                std::thread::yield_now();
+            } else {
+                spin = spin.wrapping_add(1);
+                (0..spin.min(100)).for_each(|_| std::sync::atomic::spin_loop_hint());
+            }
         }
     }
 
@@ -200,39 +224,51 @@ impl<T> Shared<T> {
         self.try_send_inner(item, false)
     }
 
-    fn try_send_inner(&self, mut item: T, block: bool) -> Result<(), TrySendError<T>> {
-        loop {
-            item = match self.with_lock(|inner| {
-                if inner.disconnected {
-                    Err(TrySendError::Disconnected(item))
-                } else if inner.queue.len() == inner.max_items {
-                    if block {
-                        inner.senders_waiting += 1;
+    fn try_send_inner(&self, item: T, block: bool) -> Result<(), TrySendError<T>> {
+        if let Some(available) = self.available.as_ref() {
+            'outer: loop {
+                let mut remaining = available.load(Ordering::Relaxed);
+                while remaining != 0 {
+                    match available.compare_exchange_weak(
+                        remaining,
+                        remaining - 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break 'outer,
+                        Err(e) => remaining = e,
                     }
-                    Err(TrySendError::Full(item))
+                }
+                if block {
+                    self.send_signal.wait(None);
                 } else {
-                    inner.queue.push_back(item);
-                    Ok(replace(&mut inner.reciever_waiting, false))
+                    return Err(TrySendError::Full(item));
                 }
-            }) {
-                Ok(notify_receiver) => {
-                    if notify_receiver {
-                        self.recv_signal.notify();
-                    }
-                    return Ok(())
-                },
-                Err(TrySendError::Full(item)) => {
-                    if block {
-                        self.send_signal.wait(None);
-                        item
-                    } else {
-                        return Err(TrySendError::Full(item))
-                    }
-                }
-                Err(TrySendError::Disconnected(item)) => {
-                    return Err(TrySendError::Disconnected(item));
-                },
             }
+        }
+
+        match self.with_lock(|inner| {
+            if inner.disconnected {
+                Err(item)
+            } else {
+                inner.queue.push_back(item);
+                Ok(replace(&mut inner.reciever_waiting, false))
+            }
+        }) {
+            Ok(notify_receiver) => {
+                if notify_receiver {
+                    self.recv_signal.notify();
+                }
+                Ok(())
+            },
+            Err(item) => {
+                if let Some(available) = self.available.as_ref() {
+                    if available.fetch_add(1, Ordering::Relaxed) == 0 {
+                        self.send_signal.notify();
+                    }
+                }
+                Err(TrySendError::Disconnected(item))
+            },
         }
     }
 
@@ -262,27 +298,31 @@ impl<T> Shared<T> {
     }
 
     fn try_recv_inner(&self, deadline: Option<Option<Instant>>) -> Result<T, Option<RecvTimeoutError>> {
-        loop {
-            match self.with_lock(|inner| {
-                if inner.disconnected {
-                    Err(true)
-                } else if let Some(item) = inner.queue.pop_front() {
-                    Ok((item, inner.senders_waiting > 0 && {
-                        inner.senders_waiting -= 1;
-                        true
-                    }))
-                } else {
-                    inner.reciever_waiting = deadline.is_some();
-                    Err(false)
-                }
-            }) {
-                Ok((item, notify_sender)) => {
-                    if notify_sender {
-                        self.send_signal.notify();
+        unsafe {
+            loop {
+                let local_queue = &mut *self.local_queue.get();
+                if let Some(item) = local_queue.pop_front() {
+                    if let Some(available) = self.available.as_ref() {
+                        if available.fetch_add(1, Ordering::Relaxed) == 0 {
+                            self.send_signal.notify();
+                        }
                     }
                     return Ok(item);
-                },
-                Err(disconnected) => {
+                }
+
+                if let Err(disconnected) = self.with_lock(|inner| {
+                    swap(local_queue, &mut inner.queue);
+                    if local_queue.len() == 0 {
+                        if inner.disconnected {
+                            Err(true)
+                        } else {
+                            inner.reciever_waiting = deadline.is_some();
+                            Err(false)
+                        }
+                    } else {
+                        Ok(())
+                    }
+                }) {
                     if disconnected {
                         return Err(Some(RecvTimeoutError::Disconnected));
                     } else if let Some(deadline) = deadline {
@@ -290,9 +330,9 @@ impl<T> Shared<T> {
                             return Err(Some(RecvTimeoutError::Timeout));
                         }
                     } else {
-                        return Err(None)
+                        return Err(None);
                     }
-                },
+                }
             }
         }
     }
