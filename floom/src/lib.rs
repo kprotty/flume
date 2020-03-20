@@ -180,27 +180,44 @@ impl<T> Shared<T> {
     }
 
     fn with_lock<R>(&self, f: impl FnOnce(&mut Inner<T>) -> R) -> R {
-        #[allow(unused)]
-        let mut spin: usize = 0;
-        loop {
-            if !self.locked.load(Ordering::Relaxed) {
-                if self
-                    .locked
-                    .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    let result = f(unsafe { &mut *self.inner.get() });
-                    self.locked.store(false, Ordering::Release);
-                    return result;
-                }
-            }
-            if cfg!(unix) {
-                std::thread::yield_now();
-            } else {
-                spin = spin.wrapping_add(1);
-                (0..spin.min(100)).for_each(|_| std::sync::atomic::spin_loop_hint());
+        #[inline]
+        fn lock(locked: &AtomicBool) {
+            if locked.compare_exchange_weak(
+                false,
+                true,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ).is_err() {
+                lock_slow(locked);
             }
         }
+
+        #[cold]
+        fn lock_slow(locked: &AtomicBool) {
+            #[allow(unused)]
+            let mut spin: usize = 0;
+            loop {
+                if !locked.load(Ordering::Relaxed) {
+                    if locked
+                        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                if cfg!(unix) {
+                    std::thread::yield_now();
+                } else {
+                    spin = spin.wrapping_add(1);
+                    (0..spin.min(100)).for_each(|_| std::sync::atomic::spin_loop_hint());
+                }
+            }
+        }
+
+        lock(&self.locked);
+        let result = f(unsafe { &mut *self.inner.get() });
+        self.locked.store(false, Ordering::Release);
+        result
     }
 
     pub fn disconnect(&self, is_sender: bool) {
