@@ -1,4 +1,16 @@
+//! Types that permit waiting upon multiple blocking operations using the [`Selector`] interface.
+
 use crate::*;
+
+// A unique token corresponding to an event in a selector
+pub(crate) type Token = usize;
+
+// Used to signal to selectors that an event is ready
+pub(crate) struct SelectorSignal {
+    pub(crate) wait_lock: Mutex<Option<usize>>,
+    pub(crate) trigger: Condvar,
+    //listeners: AtomicUsize,
+}
 
 /// A type used to wait upon multiple blocking operations at once.
 ///
@@ -43,7 +55,7 @@ impl<'a, T> Selector<'a, T> {
         }
     }
 
-    /// Add a send operation to the selector.
+    /// Add a send operation to the selector that sends the provided value.
     ///
     /// Once added, the selector can be used to run the provided handler function on completion of
     /// this operation.

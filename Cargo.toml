@@ -1,6 +1,6 @@
 [package]
 name = "flume"
-version = "0.6.1"
+version = "0.7.0"
 authors = ["Joshua Barretto <joshua.s.barretto@gmail.com>"]
 edition = "2018"
 description = "A blazingly fast multi-producer channel"
@@ -12,15 +12,19 @@ readme = "README.md"
 
 [features]
 select = []
-default = ["select"]
+async = []
+receiver_buffer = ["arraydeque"]
+default = ["select", "async", "receiver_buffer"]
 
 [dependencies]
 spin = "0.5"
+arraydeque = { version = "0.4", optional = true }
 
 [dev-dependencies]
 floom = { path = "./floom" }
 crossbeam-channel = "0.4"
 criterion = "0.2"
+async-std = { version = "1.5", features = ["attributes"] }
 
 [[bench]]
 name = "basic"
