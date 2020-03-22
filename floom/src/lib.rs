@@ -83,7 +83,7 @@ impl<T> Shared<T> {
     }
 
     pub fn disconnect(&self, is_sender: bool) {
-        self.inner.lock().disconnected = true;
+        self.inner.locked(|inner| inner.disconnected = true);
         if is_sender {
             self.recv_signal.notify();
         } else {
@@ -131,14 +131,13 @@ impl<T> Shared<T> {
     fn try_send_inner(&self, mut item: T, block: bool) -> Result<(), TrySendError<T>> {
         let capacity = self.capacity.unwrap_or(usize::max_value());
         loop {
-            item = match {
-                let mut inner = self.inner.lock();
+            item = match self.inner.locked(|inner| {
                 if inner.disconnected || inner.queue.len() == capacity {
                     Err((inner.disconnected, item))
                 } else {
                     Ok(inner.queue.push_back(item))
                 }
-            } {
+            }) {
                 Ok(()) => {
                     self.recv_signal.notify();
                     return Ok(());
@@ -170,8 +169,7 @@ impl<T> Shared<T> {
                 return Ok(item);
             }
 
-            match {
-                let mut inner = self.inner.lock();
+            match self.inner.locked(|inner| {
                 if is_bounded {
                     if let Some(item) = inner.queue.pop_front() {
                         Ok(Some(item))
@@ -186,7 +184,7 @@ impl<T> Shared<T> {
                         Err(inner.disconnected)
                     }
                 }
-            } {
+            }) {
                 Ok(None) => {},
                 Ok(Some(item)) => {
                     self.send_signal.notify();
