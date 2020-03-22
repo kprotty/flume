@@ -1,5 +1,5 @@
 use std::time::{Instant, Duration};
-use flume::*;
+use floom::*;
 
 #[test]
 fn send_recv() {
@@ -86,17 +86,6 @@ fn disconnect_rx() {
 }
 
 #[test]
-fn drain() {
-    let (tx, rx) = unbounded();
-
-    for i in 0..100 {
-        tx.send(i).unwrap();
-    }
-
-    assert_eq!(rx.drain().sum::<u32>(), (0..100).sum());
-}
-
-#[test]
 fn try_send() {
     let (tx, rx) = bounded(5);
 
@@ -118,26 +107,37 @@ fn try_send() {
 
 #[test]
 fn send_bounded() {
+    const NUM_THREADS: u64 = 10;
+    const NUM_ITERS: u64 = 100;
     let (tx, rx) = bounded(5);
 
     let mut ts = Vec::new();
-    for _ in 0..100 {
+    for _ in 0..NUM_THREADS {
         let tx = tx.clone();
         ts.push(std::thread::spawn(move || {
-            for i in 0..10000 {
+            for i in 0..NUM_ITERS {
                 tx.send(i).unwrap();
+                //println!("send {}", i);
             }
         }));
     }
 
     drop(tx);
-
-    assert_eq!(rx.iter().sum::<u64>(), (0..10000).sum::<u64>() * 100);
+    
+    let mut i = 0;
+    let mut x = 0;
+    while let Ok(item) = rx.recv_timeout(std::time::Duration::from_millis(1000)) {
+        x += item;
+        i += 1;
+    }
+    println!("i: {}", i);
+    assert_eq!(x, (0..NUM_ITERS).sum::<u64>() * NUM_THREADS);
+    //assert_eq!(rx.iter().sum::<u64>(), (0..NUM_ITERS).sum::<u64>() * NUM_THREADS);
 
     for t in ts {
         t.join().unwrap();
     }
-
+    
     assert!(rx.recv().is_err());
 }
 
@@ -157,6 +157,7 @@ fn rendezvous() {
     t.join().unwrap();
 }
 
+/*
 #[test]
 fn hydra() {
     let thread_num = 32;
@@ -196,6 +197,7 @@ fn hydra() {
     drop(txs);
     assert!(main_rx.recv().is_err());
 }
+*/
 
 #[test]
 fn robin() {
