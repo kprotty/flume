@@ -64,25 +64,55 @@ mod lock_impl {
 
 #[cfg(windows)]
 mod lock_impl {
-    use std::sync::{Mutex, MutexGuard};
+    use crate::sync::{Backoff, CachePadded};
+    use std::sync::{
+        Mutex,
+        MutexGuard,
+        atomic::{spin_loop_hint, Ordering, AtomicBool},
+    };
 
-    pub struct Lock {
-        inner: Mutex<()>,
+    pub enum Lock {
+        Blocking(Mutex<()>),
+        Spinning(CachePadded<AtomicBool>),
     }
 
     impl Lock {
         pub fn new() -> Self {
-            Self {
-                inner: Mutex::new(()),
+            // AMD (Ryzen) CPUs prefer std Mutex
+            // Intel CPU prefer spin lock
+            if Backoff::new().max_spin == 0 {
+                Self::Blocking(Mutex::new(()))
+            } else {
+                Self::Spinning(CachePadded::new(AtomicBool::new(false)))
             }
         }
 
-        pub fn acquire(&self) -> MutexGuard<'_, ()> {
-            self.inner.lock().unwrap()
+        pub fn acquire(&self) -> Option<MutexGuard<'_, ()>> {
+            match self {
+                Self::Blocking(mutex) => Some(mutex.lock().unwrap()),
+                Self::Spinning(is_locked) => {
+                    let mut spin: usize = 0;
+                    loop {
+                        if !is_locked.load(Ordering::Relaxed) {
+                            if is_locked
+                                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                                .is_ok()
+                            {
+                                return None;
+                            }
+                        }
+                        spin = spin.wrapping_add(1);
+                        (0..spin.min(100)).for_each(|_| spin_loop_hint());
+                    }
+                },
+            }
         }
 
-        pub fn release(&self, guard: MutexGuard<'_, ()>) {
-            std::mem::drop(guard);
+        pub fn release(&self, guard: Option<MutexGuard<'_, ()>>) {
+            match self {
+                Self::Blocking(_) => std::mem::drop(guard),
+                Self::Spinning(is_locked) => is_locked.store(false, Ordering::Release),
+            }
         }
     }
 }

@@ -1,4 +1,7 @@
 use std::time::{Instant, Duration};
+#[cfg(not(feature = "use_floom"))]
+use flume::*;
+#[cfg(feature = "use_floom")]
 use floom::*;
 
 #[test]
@@ -86,6 +89,17 @@ fn disconnect_rx() {
 }
 
 #[test]
+fn drain() {
+    let (tx, rx) = unbounded();
+
+    for i in 0..100 {
+        tx.send(i).unwrap();
+    }
+
+    assert_eq!(rx.drain().sum::<u32>(), (0..100).sum());
+}
+
+#[test]
 fn try_send() {
     let (tx, rx) = bounded(5);
 
@@ -107,8 +121,6 @@ fn try_send() {
 
 #[test]
 fn send_bounded() {
-    const NUM_THREADS: u64 = 10;
-    const NUM_ITERS: u64 = 100;
     let (tx, rx) = bounded(5);
 
     for _ in 0..5 {
@@ -123,33 +135,26 @@ fn send_bounded() {
 
     rx.drain();
 
+    let thread_num = 10;
+    let msg_num = 1000;
     let mut ts = Vec::new();
-    for _ in 0..NUM_THREADS {
+    for _ in 0..thread_num {
         let tx = tx.clone();
         ts.push(std::thread::spawn(move || {
-            for i in 0..NUM_ITERS {
+            for i in 0..msg_num {
                 tx.send(i).unwrap();
-                //println!("send {}", i);
             }
         }));
     }
 
     drop(tx);
-    
-    let mut i = 0;
-    let mut x = 0;
-    while let Ok(item) = rx.recv_timeout(std::time::Duration::from_millis(1000)) {
-        x += item;
-        i += 1;
-    }
-    println!("i: {}", i);
-    assert_eq!(x, (0..NUM_ITERS).sum::<u64>() * NUM_THREADS);
-    //assert_eq!(rx.iter().sum::<u64>(), (0..NUM_ITERS).sum::<u64>() * NUM_THREADS);
+
+    assert_eq!(rx.iter().sum::<u64>(), (0..msg_num).sum::<u64>() * thread_num);
 
     for t in ts {
         t.join().unwrap();
     }
-    
+
     assert!(rx.recv().is_err());
 }
 
@@ -157,7 +162,7 @@ fn send_bounded() {
 fn rendezvous() {
     let (tx, rx) = bounded(0);
 
-    for i in 0..20 {
+    for i in 0..10 {
         let tx = tx.clone();
         let t = std::thread::spawn(move || {
             let then = Instant::now();
@@ -174,10 +179,9 @@ fn rendezvous() {
     }
 }
 
-/*
 #[test]
 fn hydra() {
-    let thread_num = 32;
+    let thread_num = 10;
     let msg_num = 1000;
 
     let (main_tx, main_rx) = unbounded::<()>();
@@ -197,7 +201,7 @@ fn hydra() {
 
     drop(main_tx);
 
-    for _ in 0..10000 {
+    for _ in 0..msg_num {
         for tx in &txs {
             for _ in 0..msg_num {
                 tx.send(Default::default()).unwrap();
@@ -214,7 +218,6 @@ fn hydra() {
     drop(txs);
     assert!(main_rx.recv().is_err());
 }
-*/
 
 #[test]
 fn robin() {
@@ -248,7 +251,7 @@ fn robin() {
     }
 }
 
-#[cfg(feature = "select")]
+#[cfg(all(not(feature = "use_floom"), feature = "select"))]
 #[test]
 fn select() {
     #[derive(Debug, PartialEq)]
@@ -295,7 +298,7 @@ fn select() {
 }
 
 
-#[cfg(feature = "async")]
+#[cfg(all(not(feature = "use_floom"), feature = "async"))]
 #[test]
 fn r#async() {
     let (tx, mut rx) = unbounded();
@@ -312,7 +315,7 @@ fn r#async() {
     t.join().unwrap();
 }
 
-#[cfg(feature = "async")]
+#[cfg(all(not(feature = "use_floom"), feature = "async"))]
 #[async_std::test]
 async fn send_100_million_no_drop_or_reorder() {
     #[derive(Debug)]

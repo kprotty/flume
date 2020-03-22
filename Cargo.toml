@@ -13,6 +13,7 @@ readme = "README.md"
 [features]
 select = []
 async = []
+use_floom = []
 default = ["select", "async"]
 
 [dependencies]

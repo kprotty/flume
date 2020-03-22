@@ -1,6 +1,6 @@
 pub struct Backoff {
     iteration: usize,
-    max_spin: usize,
+    pub max_spin: usize,
 }
 
 impl Backoff {

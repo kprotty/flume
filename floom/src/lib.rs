@@ -2,6 +2,7 @@ mod sync;
 use sync::{Mutex, Signal};
 
 use std::{
+    mem::{swap, replace},
     cell::{RefCell, UnsafeCell},
     collections::VecDeque,
     time::{Duration, Instant},
@@ -41,7 +42,7 @@ pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
 }
 
 pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    Shared::new(Some(capacity))
+    Shared::new(Some(if capacity == 0 { 1 } else { capacity }))
 }
 
 struct Inner<T> {
@@ -178,7 +179,7 @@ impl<T> Shared<T> {
                     }
                 } else {
                     if inner.queue.len() > 0 {
-                        std::mem::swap(&mut inner.queue, local_queue);
+                        swap(&mut inner.queue, local_queue);
                         Ok(None)
                     } else {
                         Err(inner.disconnected)
@@ -294,6 +295,41 @@ impl<T> Receiver<T> {
         }
 
         TryIter { receiver: self }
+    }
+
+    pub fn drain(&self) -> impl Iterator<Item = T> + ExactSizeIterator {
+        struct Drain<T> {
+            local_queue: VecDeque<T>,
+            shared_queue: VecDeque<T>,
+        }
+
+        impl<T> ExactSizeIterator for Drain<T> {
+            fn len(&self) -> usize {
+                self.local_queue.len() + self.shared_queue.len()
+            }
+        }
+
+        impl<T> Iterator for Drain<T> {
+            type Item = T;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                self.local_queue
+                    .pop_front()
+                    .or_else(|| self.shared_queue.pop_front())
+            }
+        }
+
+        let local_queue = replace(&mut *self.local_queue.borrow_mut(), VecDeque::new());
+        let shared_queue = self.shared.inner.locked(|inner|
+            replace(&mut inner.queue, VecDeque::new()));
+        if shared_queue.len() > 0 {
+            self.shared.send_signal.notify();
+        }
+
+        Drain {
+            local_queue,
+            shared_queue,
+        }
     }
 }
 
