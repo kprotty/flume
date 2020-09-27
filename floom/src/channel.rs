@@ -1,218 +1,283 @@
+// Copyright (c) 2020 kprotty
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::lock::Lock;
 use std::{
     pin::Pin,
-    cell::Cell,
-    mem::replace,
-    iter,
-    ptr::NonNull,
+    time::{Instant, Duration},
+    mem::MaybeUninit,
     future::Future,
     marker::PhantomPinned,
-    task::{Poll, Context, Waker, RawWaker, RawWakerVTable},
+    ptr::NonNull,
+    cell::Cell,
+    task::{Task, Poll, Waker, RawWaker, RawWakerVTable, Context},
 };
 
-pub(crate) trait Queue {
-    type Item;
-
-    fn push(&mut self, item: Self::Item) -> Result<(), Self::Item>;
-
-    fn pop(&mut self) -> Option<Self::Item>;
-}
-
-pub(crate) type Channel<Q> = Chan<Q>;
-
-pub(crate) struct Chan<Q: Queue> {
-    queue: Option<Q>,
-    senders: WaiterQueue<Q::Item>,
-    receivers: WaiterQueue<Q::Item>,
-}
-
-impl<Q: Queue> Chan<Q> {
-    pub fn new(queue: Q) -> Self {
-        Self {
-            queue: Some(queue),
-            senders: WaiterQueue::new(),
-            receivers: WaiterQueue::new(),
-        }
-    }
-
-    pub fn close(&mut self) -> Vec<Waker> {
-        self.queue = None;
-        let senders = replace(&mut self.senders, WaiterQueue::new());
-        let receivers = replace(&mut self.receivers, WaiterQueue::new());
-
-        let num_waiters = senders.size + receivers.size;
-        if num_waiters == 0 {
-            return Vec::new();
-        }
-
-        let mut waiters = iter::from_fn(move || {
-            senders.pop().or_else(|| receivers.pop())
-        });
-            
-        let mut wakers = Vec::with_capacity(num_waiters);
-        for waiter in waiters {
-            wakers.push(match waiter.state.replace(WaiterState::Closed) {
-                WaiterStaet::Receiving(waker) => waker,
-                WaiterState::Sending(waker, _) => waker,
-                _ => unreachable!("invalid waiter state"),
-            });
-        }
-            
-        wakers
-    }
-
-    pub fn try_send(&mut self, item: Q::Item) -> Result<Option<Waker>, SendError<Self::Item>> {
-        if let Some(queue) = self.queue.as_mut() {
-            if let Some(waiter) = self.receivers.pop() {
-                match waiter.state.replace(WaiterState::Received(item)) {
-                    WaiterState::Receiving(waker) => Ok(Some(waker)),
-                    _ => unreachable!("invalid receiver state"),
-                }
-            } else if let Err(item) = queue.push(item) {
-                Err(SendError::Full(item))
-            } else {
-                Ok(None)
-            }
-        } else {
-            Err(SendError::Closed)
-        }
-    }
-
-    pub fn try_recv(&mut self) -> Result<(Option<Waker>, Self::Item), RecvError> {
-        if let Some(queue) = self.queue.as_mut() {
-            if let Some(waiter) = self.senders.pop() {
-                match waiter.state.replace(WaiterState::Sent) {
-                    WaiterState::Sending(waker, item) => Ok((Some(waker), item)),
-                    _ => unreachable!("invalid sender state"),
-                }
-            } else if let Some(item) = queue.pop() {
-                Ok((None, item))
-            } else {
-                Err(RecvError::Empty)
-            }
-        } else {
-            Err(RecvError::Closed)
-        }
-    }
-}
-
-pub(crate) enum SendError<T> {
-    Full(T),
+pub enum RecvError {
     Closed,
 }
 
-pub(crate) enum RecvError {
+pub enum SendError {
+    Closed,
+}
+
+pub enum TryRecvError {
     Empty,
     Closed,
 }
 
+pub enum TrySendError<T> {
+    Full(T),
+    Closed,
+}
+
+pub enum TryRecvTimeoutError {
+    Closed,
+    TimedOut,
+}
+
+pub enum TrySendTimeoutError<T> {
+    Closed,
+    TimedOut(T)
+}
+
+pub struct Channel<T>(Lock<Chan<T>>);
+
+impl<T> Channel<T> {
+    pub fn unbounded() -> Self {
+        Self::with_buffer(Buffer::Unbounded({
+            Vec::new().into_boxed_slice()
+        }))
+    }
+
+    pub fn bounded(capacity: usize) -> Self {
+        Self::with_buffer(Buffer::Bounded({
+            let mut buf = Vec::with_capacity(0);
+            (0..capacity).for_each(|| buf.push(MaybeUninit::uninit()));
+            buf.into_boxed_slice()
+        }))
+    }
+
+    fn with_buffer(buffer: Buffer<T>) -> Self {
+        Self(Lock::new(Chan {
+            head: 0,
+            tail: 0,
+            buffer,
+            senders: WaiterQueue::new(),
+            receivers: WaiterQueue::new(),
+        }))
+    }
+
+    pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
+        self.0.with(|chan| chan.try_send(item))
+    }
+
+    pub fn send_async(&self, item: T) -> SendFuture<'_, T> {
+        SendFuture::new(self, item)
+    }
+
+    pub fn send(&self, item: T) -> Result<(), SendError> {
+        match self.send_sync(None, item) {
+
+        }
+    }
+
+    pub fn try_send_for(&self, item: T, timeout: Duration) -> Result<(), TrySendTimeoutError<T>> {
+        self.try_send_until(item, Instant::now() + timeout)
+    }
+
+    pub fn try_send_until(&self, item: T, deadline: Instant) -> Result<(), TrySendTimeoutError<T>> {
+        Self::sync(Some(deadline), self.send_async(item))
+    }
+
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        self.0.with(|chan| unsafe { chan.try_recv() })
+    }
+
+    pub fn recv_async(&self) -> RecvFuture<'_, T> {
+        RecvFuture::new(self)
+    }
+
+    pub fn recv(&self) -> Result<T, RecvError> {
+        Self::sync(None, self.recv_async())
+    }
+
+    pub fn try_recv_for(&self, timeout: Duration) -> Result<T, TryRecvTimeoutError> {
+        self.try_recv_until(Instant::now() + timeout)
+    }
+
+    pub fn try_recv_until(&self, deadline: Instant) -> Result<T, TryRecvTimeoutError> {
+        Self::sync(Some(deadline), self.recv_async())
+    }
+
+    fn send_sync<T>() {
+        self.sync(
+            None,
+            item,
+            |item, chan, waker_fn| match chan.try_send(item) {
+                Ok(_) => Ok(Ok()),
+                Err(TrySendError::Closed) => Ok(Err(SendError::Closed)),
+                Err(TrySendError::Full(item)) => Err(WaiterState::Sending(waker_fn(), item)),
+            },
+            |waiter_state| match waiter_state {
+                WaiterState::Closed => Err(SendError::Closed),
+                WaiterState::Sent => Ok(()),
+                _ => unreachable!("invalid send waiter_state"),
+            } 
+        )
+    }
+
+    fn sync<I>(
+        &self,
+        deadline: Option<Instant>, mut future: F) -> F::Output {
+
+    }
+}
+
+pub enum FutureError {
+    Closed
+}
+
+enum FutureOpState<'a, T> {
+    TryOp(&'a Channel<T>, Option<T>),
+    Waiting(&'a Channel<T>),
+    Completed,
+}
+
+struct FutureOp<'a, T> {
+    state: FutureOpState<'a, T>,
+    waker: AtomicWaker,
+    waiter: Waiter<T>,
+}
+
+pub struct SendFuture<'a, T>(FutureOp<'a, T>);
+
+impl<'a, T> Future for SendFuture<'a, T> {
+    type Output = Result<(), SendError<T>>;
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut_self = unsafe { Pin::get_unchecked_mut(self) };
+        match mut_self.0.state {
+            FutureOpState::TryOp(channel, item) => match channel.0.with(|chan| unsafe {
+                let item = item.expect("SendFuture without a item");
+                let item = match chan.try_send(item) {
+                    Ok(_) => return Poll::Ready(Ok()),
+                    Err(SendError::Full(item)) => item,
+                    Err(SendError::Closed) => return Poll::Ready(Err(SendError::Closed)),
+                    _ => unreachable!("invalid try_send() item"),
+                };
+                
+                let waker = ctx.waker().clone();
+                mut_self.0.waiter.state.set(WaiterState::Sending(waker, item));
+                self.senders.push(&mut_self.0.waiter); 
+                Poll::Pending
+            }) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(output) => {
+                    mut_self.0.state = FutureOpState::Completed;
+                    Poll::Ready(output)
+                },
+            },
+            FutureOpState::Waiting(channel) => match mut_self.0.waker.poll(ctx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => {
+                    mut_self.0.state = FutureOpState::Completed;
+                    Poll::Ready(match mut_self.0.waiter.state.replace(WaiterState::Closed) {
+                        WaiterState::Closed => Err(SendError::Closed),
+                        WaiterState::Sent => Ok(())
+                    })
+                }
+            },
+            FutureOpState::Completed => {
+                unreachable!("SendFuture polled after completion");
+            },
+        }
+    }
+}
+
+enum Buffer<T> {
+    Closed,
+    Bounded(Box<[MaybeUninit<T>]>),
+    Unbounded(Box<[MaybeUninit<T>]>),
+}
+
+struct Chan<T> {
+    head: usize,
+    tail: usize,
+    buffer: Buffer<T>,
+    senders: WaiterQueue<T>,
+    receivers: WaiterQueue<T>,
+}
+
+impl<T> Chan<T> {
+    unsafe fn try_send(&mut self, item: T) -> Result<(), SendError<T>> {
+
+    }
+
+    unsafe fn try_recv(&mut self) -> Result<T, RecvError> {
+
+    }
+}
+
 struct WaiterQueue<T> {
     head: Option<NonNull<Waiter<T>>>,
-    size: usize,
 }
 
 impl<T> WaiterQueue<T> {
     fn new() -> Self {
         Self {
             head: None,
-            size: 0,
         }
     }
 
-    fn push(&mut self, waiter: Pin<&mut Waiter<T>>) {
-        unsafe {
-            let waiter_ptr = NonNull::from(&*waiter);
-            waiter.next.set(None);
-            waiter.tail.set(waiter_ptr);
-            self.size += 1;
+    unsafe fn push(&mut self, waiter: &Waiter<T>) {
 
-            if let Some(head_ptr) = self.head {
-                let tail_ptr = head.as_ref().tail.get();
-                tail_ptr.as_ref().next.set(Some(waiter_ptr));
-                head_ptr.as_ref().tail.set(waiter_ptr);
-                waiter.prev.set(Some(tail_ptr));
-            } else {
-                self.head = Some(waiter_ptr);
-                waiter.prev.set(None);
-            }
-        }
     }
 
-    fn pop<'a>(&mut self) -> Option<Pin<&'a mut Waiter<T>>> {
-        self.head.map(|waiter_ptr| unsafe {
-            let waiter = &mut *waiter_ptr.as_ptr();
-            assert!(self.try_remove(Pin::new_unchecked(waiter)));
-            Pin::new_unchecked(waiter)
-        })
+    unsafe fn pop<'a>(&mut self) -> Option<&'a Waiter<T>> {
+
     }
 
-    fn try_remove(&mut self, waiter: Pin<&mut Waiter<T>>) -> bool {
-        unsafe {
-            let head_ptr = match self.head {
-                Some(head_ptr) => head_ptr,
-                None => return false,
-            };
+    unsafe fn try_remove(&mut self, waiter: &Waiter<T>) -> bool {
 
-            let prev_ptr = waiter.prev.get();
-            let next_ptr = waiter.next.get();
-            let tail_ptr = head_ptr.as_ref().tail.get();
-            let waiter_ptr = NonNull::from(&*waiter);
-
-            if let Some(prev_ptr) = prev_ptr {
-                prev_ptr.as_ref().next.set(next_ptr);
-            }
-            if let Some(next_ptr) = next_ptr {
-                next_ptr.as_ref().prev.set(prev_ptr);
-            }
-
-            if head_ptr == waiter_ptr {
-                self.head = next_ptr;
-                if let Some(new_head_ptr) = next_ptr {
-                    new_head_ptr.as_ref().tail.set(tail_ptr);
-                }
-            } else if tail_ptr == waiter_ptr {
-                if let Some(new_tail_ptr) = prev_ptr {
-                    head_ptr.as_ref().tail.set(new_tail_ptr);
-                }
-            } else if prev_ptr.is_none() && next_ptr.is_none() {
-                return false;
-            }
-
-            waiter.prev.set(None);
-            waiter.next.set(None);
-            waiter.tail.set(waiter_ptr);
-
-            self.size -= 1;
-            true
-        }
     }
+}
+
+enum WaiterState<T> {
+    Closed,
+    Sending(Waker, T),
+    Sent,
+    Receiving(Waker),
+    Received(T),
 }
 
 struct Waiter<T> {
     prev: Cell<Option<NonNull<Self>>>,
     next: Cell<Option<NonNull<Self>>>,
-    tail: Cell<NonNull<Self>>,
+    tail: Cell<Option<NonNull<Self>>>,
     state: Cell<WaiterState<T>>,
     _pinned: PhantomPinned,
 }
 
-impl<T> Waiter<T> {
-    fn new(state: WaiterState<T>) -> Self {
+impl<T> From<WaiterState<T>> for Waiter<T> {
+    fn from(state: WaiterState<T>) -> Self {
         Self {
             prev: Cell::new(None),
             next: Cell::new(None),
-            tail: Cell::new(NonNull::dangling()),
+            tail: Cell::new(None),
             state: Cell::new(state),
             _pinned: PhantomPinned,
         }
     }
 }
-
-enum WaiterState<T> {
-    Sending(Waker, T),
-    Sent,
-    Receiving(Waker),
-    Received(T),
-    Closed,
-}
-
