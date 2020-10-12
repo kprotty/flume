@@ -28,8 +28,8 @@ pub enum RecvError {
     Closed,
 }
 
-pub enum SendError {
-    Closed,
+pub enum SendError<T> {
+    Closed(T),
 }
 
 pub enum TryRecvError {
@@ -39,7 +39,7 @@ pub enum TryRecvError {
 
 pub enum TrySendError<T> {
     Full(T),
-    Closed,
+    Closed(T),
 }
 
 pub enum TryRecvTimeoutError {
@@ -48,7 +48,7 @@ pub enum TryRecvTimeoutError {
 }
 
 pub enum TrySendTimeoutError<T> {
-    Closed,
+    Closed(T),
     TimedOut(T)
 }
 
@@ -68,6 +68,16 @@ impl<T> Channel<T> {
             Some(capacity) => Chan::<T>::bounded(capacity),
             None => Chan::<T>::unbounded(),
         }))
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.0.with(|chan| chan.is_closed())
+    }
+
+    pub fn close(&self) {
+        for waker in self.0.with(|chan| chan.close()) {
+            waker.wake();
+        }
     }
 
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
@@ -256,22 +266,152 @@ impl<T> Chan<T> {
         }
     }
 
+    fn is_unbounded(&self) -> bool {
+        self.capacity & 1 == 0
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity >> 1
+    }
+
+    fn size(&self) -> usize {
+        self.tail.wrapping_sub(self.head)
+    }
+
+    fn wrap(&self, index: usize) -> usize {
+        let capacity = self.capacity();
+        if capacity.is_power_of_two() {
+            index & (capacity - 1)
+        } else {
+            index % capacity
+        }
+    }
+
+    fn closed_ptr() -> usize {
+        use std::mem::MaybeUninit;
+
+        struct Global<T>(MaybeUninit<T>);
+
+        unsafe impl Send for Global<T> {}
+        unsafe impl Sync for Global<T> {}
+
+        static CLOSED: Global<T> = Global(MaybeUninit::<T>::uninit());
+
+        CLOSED.0.as_ptr() as usize
+    }
+
+    fn is_closed(&self) -> bool {
+        self.buffer == Self::closed_ptr()
+    }
+
+    unsafe fn close(&mut self) -> WaiterQueue {
+        if !self.is_closed() {
+            let buffer = std::mem::replace(&mut self.buffer, Self::closed_ptr());
+            if buffer != 0 {
+                while self.size() != 0 {
+                    std::mem::drop(self.pop());
+                }
+            }
+        }
+
+        let mut waiters = WaiterQueue::new();
+        waiters.consume(&mut self.senders);
+        waiters.consume(&mut self.receivers);
+        waiters
+    }
+
     unsafe fn try_send(&mut self, item: T) -> Result<Option<Waker>, TrySendError<T>> {
+        if self.is_closed() {
+            return Err(TrySendError::Closed(item));
+        }
+        
         if let Some(waiter) = self.receivers.pop() {
             match waiter.state.replace(WaiterState::Received(item)) {
                 WaiterState::Receiving => return Ok(waiter.waker.wake()),
                 _ => unreachable!("invalid enqueued receiver state"),
             }
         }
+        
+        let size = self.size();
+        let capacity = self.capacity();
+        let is_unbounded = self.capacity & 1 == 0;
 
-        // TODO:
-        // capacity & 1 == bound(capacity >> 1)
-        // lazy init buffer
-        // buffer pointing to static MaybeUninit<T>  == closed
+        if is_unbounded {
+            if capacity == 0 {
+                self.grow(8);
+            } else if size == capacity {
+                self.grow(capacity << 1);
+            }
+        } else if size == capacity {
+            return Err(TrySendError::Full(item));
+        } else if self.buffer == 0 {
+            self.grow(capacity);
+        } 
+        
+        self.push(item);
+        Ok(None)
     }
 
     unsafe fn try_recv(&mut self) -> Result<(T, Option<Waker>), TryRecvError> {
+        if self.is_closed() {
+            return Err(TryRecvError::Closed);
+        }
+        
+        if let Some(waiter) = self.senders.pop() {
+            match waiter.state.replace(WaiterState::Sent) {
+                WaiterState::Sending(item) => return Ok((item, waiter.waker.wake())),
+                _ => unreachable!("invalid enqueued sender state"),
+            }
+        }
+        
+        if self.size() == 0 {
+            return Err(TryRecvError::Empty);
+        }
 
+        let item = self.pop();
+        Ok((item, None))
+    }
+
+    unsafe fn push(&mut self, item: T) {
+        let index = self.wrap(self.tail);
+        self.tail = self.wrap(self.tail.wrapping_add(1));
+
+        let buffer = NonNull::<T>::new_unchecked(self.buffer);
+        let ptr = buffer.as_ptr().add(index);
+        std::ptr::write(ptr, item);
+    }
+
+    unsafe fn pop(&mut self) -> T {
+        let index = self.wrap(self.head);
+        self.head = self.wrap(self.head.wrapping_add(1));
+
+        let buffer = NonNull::<T>::new_unchecked(self.buffer);
+        let ptr = buffer.as_ptr().add(index);
+        std::ptr::read(ptr)
+    }
+
+    unsafe fn grow(&mut self, new_capacity: usize) {
+        use std::alloc::{alloc, dealloc, Layout};
+
+        let new_buffer = {
+            let layout = Layout::array::<T>(new_capacity).unwrap();
+            alloc(layout)
+        };
+
+        let capacity = self.capacity();
+        for offset in 0..capacity {
+            std::ptr::write(new_buffer.add(offset), self.pop());
+        }
+
+        if self.buffer != 0 {
+            let layout = Layout::array::<T>(capacity).unwrap();
+            dealloc(self.buffer as *mut T, layout);
+        }
+
+        self.head = 0;
+        self.tail = capacity;
+        self.capacity = new_capacity;
+        self.buffer = new_buffer as usize;
     }
 }
 
@@ -283,6 +423,19 @@ impl<T> WaiterQueue<T> {
     fn new() -> Self {
         Self {
             head: None,
+        }
+    }
+
+    unsafe fn consume(&mut self, queue: &mut Self) {
+        if let Some(queue_head) = std::mem::replace(&mut queue.head, None) {
+            let queue_tail = queue_head.as_ref().tail.get().expect("queue consumed without a tail");
+            if let Some(head) = self.head {
+                let tail = head.as_ref().tail.replace(Some(queue_tail)).expect("queue consuming without a tail");
+                tail.as_ref().next.set(Some(queue_head));
+                queue_head.as_ref().prev.set(Some(tail));
+            } else {
+                self.head = queue_head;
+            }
         }
     }
 
@@ -342,8 +495,44 @@ impl<T> WaiterQueue<T> {
     }
 }
 
+impl<T> IntoIterator for WaiterQueue<T> {
+    type Item = Waker;
+    type IntoIter = ClosedIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Self::IntoInter { head: self.head }
+    }
+}
+
+struct ClosedIter<T> {
+    head: Option<NonNull<Waiter<T>>>,
+}
+
+impl<T> Iterator for ClosedIter<T> {
+    type Item = Waker;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(waiter) = self.head {
+            let waiter = unsafe { waiter.as_ref() };
+            self.head = waiter.next.get();
+
+            match waiter.state.replace(WaiterState::Closed(None)) {
+                WaiterState::Sending(item) => waiter.state.set(WaiterState::Closed(item)),
+                WaiterState::Receiving => {},
+                _ => unreachable!("invalid waiter state when closing"),
+            }
+
+            if let Some(waker) = waiter.waker.wake() {
+                return Some(waker);
+            }
+        }
+
+        None
+    }
+}
+
 enum WaiterState<T> {
-    Closed,
+    Closed(Option<T>),
     Sending(T),
     Sent,
     Receiving,
